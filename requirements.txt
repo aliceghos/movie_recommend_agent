@@ -1,0 +1,5 @@
+llama-index-core
+llama-index-llms-openai-like
+streamlit
+requests
+python-dotenv
