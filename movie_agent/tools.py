@@ -1,16 +1,17 @@
 """
-LlamaIndex FunctionTool 工具定义。
-每个函数的 docstring 会被 LLM 读取以决定何时调用该工具，因此保持英文描述。
+LangChain Tool 工具定义。
+每个函数的 description 会被 LLM 读取以决定何时调用该工具，因此保持英文描述。
 """
 
-import json
 from typing import Optional
 
-from llama_index.core.tools import FunctionTool
+from langchain_core.tools import tool
 
 from movie_agent import tmdb_client
+from movie_agent.rag import search_knowledge
 
 
+@tool
 def search_movies(query: str, year: Optional[int] = None) -> str:
     """Search for movies by title or keywords.
 
@@ -36,6 +37,7 @@ def search_movies(query: str, year: Optional[int] = None) -> str:
     return "\n".join(lines)
 
 
+@tool
 def get_movie_details(movie_id: int) -> str:
     """Get detailed information about a specific movie using its TMDB ID.
 
@@ -61,6 +63,7 @@ def get_movie_details(movie_id: int) -> str:
     )
 
 
+@tool
 def get_recommendations(movie_id: int) -> str:
     """Get movie recommendations based on a specific movie.
 
@@ -85,6 +88,7 @@ def get_recommendations(movie_id: int) -> str:
     return "\n".join(lines)
 
 
+@tool
 def discover_movies(
     genre_ids: Optional[str] = None,
     min_rating: Optional[float] = None,
@@ -122,6 +126,7 @@ def discover_movies(
     return "\n".join(lines)
 
 
+@tool
 def get_popular_movies() -> str:
     """Get the most popular movies right now.
 
@@ -143,6 +148,7 @@ def get_popular_movies() -> str:
     return "\n".join(lines)
 
 
+@tool
 def get_genres() -> str:
     """Get the full list of available movie genres and their TMDB IDs.
 
@@ -159,13 +165,38 @@ def get_genres() -> str:
     return "\n".join(lines)
 
 
-# --- Agent 工具列表 ---
+@tool
+def search_local_knowledge(query: str) -> str:
+    """Search the local knowledge base for movie reviews, genre knowledge, and film art books.
+
+    Use this tool when the user asks about:
+    - Specific movie reviews or critical analysis (e.g. "What do critics say about Inception?")
+    - Film genres and their characteristics (e.g. "What is film noir?", "Tell me about cyberpunk films")
+    - Film art theory, cinematography techniques, or filmmaking concepts (from curated film art books)
+    - Background context about a movie or film style covered in the local library
+    - Anything requiring editorial opinion rather than raw TMDB metadata
+
+    The knowledge base currently contains:
+    - Reviews: Inception, Harry Potter and the Prisoner of Azkaban, Jane Eyre,
+      Spirited Away, Wuthering Heights
+    - Genre articles: Cyberpunk films, Film Noir
+    - Film books: curated film art and theory books (PDF)
+
+    Args:
+        query: The question or topic to look up in the local knowledge base
+
+    Returns:
+        Relevant excerpts from reviews, genre articles, or film books, with source labels.
+    """
+    return search_knowledge(query)
+
 
 TOOLS = [
-    FunctionTool.from_defaults(fn=search_movies),
-    FunctionTool.from_defaults(fn=get_movie_details),
-    FunctionTool.from_defaults(fn=get_recommendations),
-    FunctionTool.from_defaults(fn=discover_movies),
-    FunctionTool.from_defaults(fn=get_popular_movies),
-    FunctionTool.from_defaults(fn=get_genres),
+    search_movies,
+    get_movie_details,
+    get_recommendations,
+    discover_movies,
+    get_popular_movies,
+    get_genres,
+    search_local_knowledge,
 ]

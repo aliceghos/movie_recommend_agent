@@ -24,7 +24,11 @@ env/
 .idea/
 *.suo
 *.user
+.claude
 
 # OS
 .DS_Store
 Thumbs.db
+
+# data
+data/

@@ -1,5 +1,5 @@
 """
-电影推荐 Agent 的 Streamlit 聊天界面。
+电影推荐 Agent 的 Streamlit 聊天界面（LangChain 版本）。
 
 启动方式：
     streamlit run app.py
@@ -7,9 +7,12 @@
 
 import asyncio
 import os
+import traceback
 
 import streamlit as st
 from dotenv import load_dotenv
+
+from movie_agent.memory import load_profile
 
 load_dotenv()
 
@@ -33,10 +36,30 @@ with st.sidebar:
     st.markdown("- Show me popular movies right now")
     st.markdown("- I'm in the mood for a funny romantic comedy")
     st.divider()
+    st.markdown("**Your Profile**")
+    _profile = load_profile()
+    _pref_keys = ("liked_genres", "disliked_genres", "liked_tones", "disliked_tones", "liked_movies", "disliked_movies")
+    if not any(_profile.get(k) for k in _pref_keys):
+        st.caption("No preferences recorded yet.")
+    else:
+        if _profile.get("liked_genres"):
+            st.markdown(f"Genres you like: {', '.join(_profile['liked_genres'])}")
+        if _profile.get("disliked_genres"):
+            st.markdown(f"Genres you avoid: {', '.join(_profile['disliked_genres'])}")
+        if _profile.get("liked_tones"):
+            st.markdown(f"Tones you enjoy: {', '.join(_profile['liked_tones'])}")
+        if _profile.get("disliked_tones"):
+            st.markdown(f"Tones you avoid: {', '.join(_profile['disliked_tones'])}")
+        if _profile.get("liked_movies"):
+            st.markdown(f"Enjoyed: {', '.join(_profile['liked_movies'])}")
+        if _profile.get("disliked_movies"):
+            st.markdown(f"Disliked: {', '.join(_profile['disliked_movies'])}")
+        if _profile.get("last_updated"):
+            st.caption(f"Updated: {_profile['last_updated'][:10]}")
+    st.divider()
     if st.button("🗑️ Clear conversation"):
         st.session_state.messages = []
-        st.session_state.agent = None
-        st.session_state.memory = None
+        st.session_state.agent_state = None
         st.rerun()
 
 # --- 检查必要的 API Key ---
@@ -49,7 +72,7 @@ if not api_key or not tmdb_key:
     st.error("**Setup required** — one or more API keys are missing.")
     if not api_key:
         st.markdown(
-            "- **API_KEY** — get yours at [console.anthropic.com](https://console.anthropic.com)"
+            "- **MINIMAX_API_KEY** — get yours at [minimaxi.com](https://www.minimaxi.com/)"
         )
     if not tmdb_key:
         st.markdown(
@@ -59,10 +82,10 @@ if not api_key or not tmdb_key:
     st.stop()
 
 # --- 初始化 Agent（每个 session 只创建一次）---
-if "agent" not in st.session_state or st.session_state.agent is None:
+if "agent_state" not in st.session_state or st.session_state.agent_state is None:
     try:
         from movie_agent.agent import create_agent
-        st.session_state.agent, st.session_state.memory = create_agent()
+        st.session_state.agent_state = create_agent()
     except Exception as e:
         st.error(f"Failed to initialize agent: {e}")
         st.stop()
@@ -82,19 +105,21 @@ for message in st.session_state.messages:
 user_input = st.chat_input("Ask me about movies...")
 
 if user_input:
-    # 显示用户消息
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 获取 Agent 回复
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 from movie_agent.agent import chat
-                response = asyncio.run(chat(st.session_state.agent, st.session_state.memory, user_input))
+                response = asyncio.run(chat(st.session_state.agent_state, user_input))
             except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[Agent Error]\n{tb}")
                 response = f"Sorry, something went wrong: {e}"
+                with st.expander("Error details (debug)"):
+                    st.code(tb)
         st.markdown(response)
 
     st.session_state.messages.append({"role": "assistant", "content": response})

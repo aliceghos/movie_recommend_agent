@@ -1,5 +1,5 @@
 """
-TMDB API 封装层，不依赖 LlamaIndex，可独立测试：
+TMDB API 封装层，不依赖 LangChain，可独立测试：
   python -c "from movie_agent.tmdb_client import get_popular_movies; print(get_popular_movies())"
 """
 
@@ -82,7 +82,7 @@ def discover_movies(
         params["with_genres"] = ",".join(str(g) for g in genre_ids)
     if min_rating is not None:
         params["vote_average.gte"] = min_rating
-        params["vote_count.gte"] = 100  # 过滤投票数过少的冷门电影
+        params["vote_count.gte"] = 100
     if year:
         params["primary_release_year"] = year
     data = _get("/discover/movie", params)
@@ -99,6 +99,7 @@ def get_genres() -> list[dict]:
     """获取 TMDB 全部电影类型及其 ID。"""
     data = _get("/genre/movie/list")
     return data.get("genres", [])
+
 
 if __name__ == '__main__':
     print(get_popular_movies())

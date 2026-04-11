@@ -1,169 +1,137 @@
 """
-基于 LlamaIndex ReActAgent + MiniMax LLM 的电影推荐 Agent。
+基于 LangChain ReAct Agent + MiniMax LLM 的电影推荐 Agent。
 对外暴露 chat() 函数供 app.py 调用。
 """
 
-import json
+import asyncio
 import os
-import re
 from typing import Any
 
-from pydantic import BaseModel, ValidationError
+import httpx
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 
-from llama_index.core.agent.react.output_parser import ReActOutputParser
-from llama_index.core.agent.react.types import BaseReasoningStep
-from llama_index.core.agent.workflow import ReActAgent
-from llama_index.core.llms import ChatMessage
-from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.llms.openai_like import OpenAILike
-
+from movie_agent.memory import (
+    extract_and_save_preferences,
+    load_profile,
+    maybe_compress_history,
+)
 from movie_agent.tools import TOOLS
 
-
-class MiniMaxToolCall(BaseModel):
-    name: str
-    parameters: dict[str, Any]
-
-
-def _extract_first_tool_call(output: str) -> tuple[str, str] | None:
-    """
-    从 MiniMax 输出中提取第一个工具调用，返回 (tool_name, raw_params)。
-    支持三种已知变体，多个工具调用只取第一个。
-
-    变体一（XML invoke）：
-        minimax:tool_call <invoke name="search_movies">
-        <tool_caller_parameters>{"query": "..."}</tool_caller_parameters></invoke>
-
-    变体二（XML action）：
-        minimax:tool_call <action>search_movies</action>
-        <action_input>{"query": "..."}</action_input></action>
-
-    变体三（JSON 风格，格式畸形）：
-        minimax:tool_call {"search_movies", "query": "..."}
-        或
-        minimax:tool_call {"name": "search_movies", "query": "..."}
-    """
-    # 变体一
-    m = re.search(
-        r'minimax:tool_call\s*<invoke\s+name="([^"]+)">\s*'
-        r"<tool_caller_parameters>(.*?)</tool_caller_parameters>\s*</invoke>",
-        output,
-        re.DOTALL,
-    )
-    if m:
-        return m.group(1), m.group(2).strip()
-
-    # 变体二
-    m = re.search(
-        r"minimax:tool_call\s*<action>(.*?)</action>\s*<action_input>(.*?)</action>",
-        output,
-        re.DOTALL,
-    )
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-
-    # 变体三：minimax:tool_call {"tool_name", "key": "value", ...}
-    # 第一个字符串字面量视为工具名，其余键值对视为参数
-    m = re.search(r'minimax:tool_call\s*\{(.*?)\}', output, re.DOTALL)
-    if m:
-        inner = m.group(1).strip()
-        # 提取工具名（第一个被引号包裹的字符串）
-        name_match = re.match(r'"([^"]+)"', inner)
-        if name_match:
-            tool_name = name_match.group(1)
-            # 把剩余部分拼成合法 JSON 对象来提取参数
-            rest = inner[name_match.end():].lstrip(", ")
-            raw_params = "{" + rest + "}" if rest else "{}"
-            return tool_name, raw_params
-
-    return None
-
-
-class MiniMaxOutputParser(ReActOutputParser):
-    """处理 MiniMax 非标准工具调用格式，转换为标准 ReAct 文本格式后交给父类解析。"""
-
-    def parse(self, output: str, is_streaming: bool = False) -> BaseReasoningStep:
-        # 提取 <think>...</think> 中的思考内容
-        think_match = re.search(r"<think>(.*?)</think>", output, re.DOTALL)
-        thought = think_match.group(1).strip() if think_match else ""
-
-        result = _extract_first_tool_call(output)
-        if result:
-            tool_name, raw_params = result
-            try:
-                params = json.loads(raw_params)
-                params = {k: v for k, v in params.items() if v is not None}
-                tool_call = MiniMaxToolCall(name=tool_name, parameters=params)
-            except (json.JSONDecodeError, ValidationError):
-                tool_call = MiniMaxToolCall(name=tool_name, parameters={})
-
-            # 重建为标准 ReAct 格式后交给父类处理
-            reconstructed = (
-                f"Thought: {thought or 'Using tool.'}\n"
-                f"Action: {tool_call.name}\n"
-                f"Action Input: {json.dumps(tool_call.parameters, ensure_ascii=False)}"
-            )
-            return super().parse(reconstructed, is_streaming=is_streaming)
-
-        # 无工具调用，直接交给父类处理（Answer: 或纯文本）
-        return super().parse(output, is_streaming=is_streaming)
-
-
 SYSTEM_PROMPT = """\
-You are a movie recommendation assistant. Use the TMDB tools to answer user requests.
+You are a movie recommendation assistant. You have access to two types of tools:
 
-STRICT OUTPUT FORMAT — follow this exactly every single step:
+1. TMDB tools — for real-time movie data:
+   search_movies, get_movie_details, get_recommendations, discover_movies,
+   get_popular_movies, get_genres
 
-Thought: <your reasoning>
-Action: <tool_name>
-Action Input: <json object with parameters>
+2. Local knowledge base tool — for editorial content:
+   search_local_knowledge — searches curated movie reviews, genre articles, and film art books.
+   Use this when the user asks for critical opinions, review excerpts, background
+   on film genres (cyberpunk, film noir), or film art theory and filmmaking concepts.
+   Covered movies: Inception, Harry Potter and the Prisoner of Azkaban, Jane Eyre,
+   Spirited Away, Wuthering Heights.
+   Also contains film art book content for questions about cinematography,
+   directing techniques, or film theory.
 
-After receiving tool results (Observation), continue with the same format.
-When ready to give the final answer:
+When you need to call a tool, reason step by step. After receiving tool results,
+continue reasoning until you have enough information to give a final answer.
 
-Thought: I now have enough information.
-Answer: <your final response>
-
-RULES:
-- Output exactly ONE Action per response, never multiple.
-- Do NOT use <think>, </think>, or any XML tags.
-- Do NOT use minimax:tool_call syntax.
-- Tool names: search_movies, get_movie_details, get_recommendations, discover_movies, get_popular_movies, get_genres.
-- Always include TMDB URL for each movie: https://www.themoviedb.org/movie/{movie_id}
+Always include the TMDB URL for each movie: https://www.themoviedb.org/movie/{movie_id}
 """
 
 
-def create_agent() -> tuple[ReActAgent, ChatMemoryBuffer]:
-    """初始化 ReActAgent，使用 MiniMax LLM 和 TMDB 工具集，返回 (agent, memory) 元组。"""
+def _build_system_prompt(profile: dict[str, Any]) -> SystemMessage:
+    """组合基础 prompt 与用户画像，生成每轮对话的 SystemMessage。"""
+    parts = [SYSTEM_PROMPT]
+
+    has_prefs = any(
+        profile.get(k)
+        for k in (
+            "liked_genres", "disliked_genres",
+            "liked_tones", "disliked_tones",
+            "liked_movies", "disliked_movies",
+        )
+    )
+
+    if has_prefs or profile.get("conversation_summary"):
+        parts.append("\n--- User Profile (from long-term memory) ---")
+        if profile.get("liked_genres"):
+            parts.append(f"Liked genres: {', '.join(profile['liked_genres'])}")
+        if profile.get("disliked_genres"):
+            parts.append(f"Disliked genres: {', '.join(profile['disliked_genres'])}")
+        if profile.get("liked_tones"):
+            parts.append(f"Liked tones: {', '.join(profile['liked_tones'])}")
+        if profile.get("disliked_tones"):
+            parts.append(f"Disliked tones: {', '.join(profile['disliked_tones'])}")
+        if profile.get("liked_movies"):
+            parts.append(f"Movies the user has enjoyed: {', '.join(profile['liked_movies'])}")
+        if profile.get("disliked_movies"):
+            parts.append(f"Movies the user disliked: {', '.join(profile['disliked_movies'])}")
+        if profile.get("conversation_summary"):
+            parts.append(f"\nPrevious conversation summary:\n{profile['conversation_summary']}")
+        parts.append("\nUse this profile to personalize your recommendations.")
+
+    return SystemMessage(content="\n".join(parts))
+
+
+def create_agent() -> dict[str, Any]:
+    """初始化 LangChain ReAct Agent，使用 MiniMax LLM 和 TMDB 工具集。
+
+    Returns:
+        包含 'agent'、'history'、'llm'、'profile' 的字典，供 chat() 跨轮次使用。
+    """
     api_key = os.getenv("MINIMAX_API_KEY", "")
     group_id = os.getenv("MINIMAX_GROUP_ID", "")
     if not api_key or not group_id:
         raise ValueError("MINIMAX_API_KEY and MINIMAX_GROUP_ID must be set.")
 
-    llm = OpenAILike(
+    llm = ChatOpenAI(
         model="MiniMax-M2.7",
-        api_base="https://api.minimaxi.com/v1",
+        base_url="https://api.minimaxi.com/v1",
         api_key=api_key,
-        is_chat_model=True,
-        is_function_calling_model=False,
-        default_headers={"GroupId": group_id},
+        http_client=httpx.Client(headers={"GroupId": group_id}),
+        http_async_client=httpx.AsyncClient(headers={"GroupId": group_id}),
     )
 
-    memory = ChatMemoryBuffer.from_defaults(token_limit=4096)
-
-    agent = ReActAgent(
+    agent = create_react_agent(
+        model=llm,
         tools=TOOLS,
-        llm=llm,
-        system_prompt=SYSTEM_PROMPT,
-        output_parser=MiniMaxOutputParser(),
-        max_iterations=8,
-        verbose=True,
     )
-    return agent, memory
+
+    return {"agent": agent, "history": [], "llm": llm, "profile": load_profile()}
 
 
-async def chat(agent: ReActAgent, memory: ChatMemoryBuffer, user_message: str) -> str:
-    """向 Agent 发送消息并返回文本回复，memory 跨轮次保持对话历史。"""
-    handler = agent.run(user_msg=user_message, memory=memory)
-    result = await handler
-    return str(result.response.content)
+async def chat(agent_state: dict[str, Any], user_message: str) -> str:
+    """向 Agent 发送消息并返回文本回复，自动处理历史压缩和偏好提取。"""
+    profile = agent_state["profile"]
+    llm = agent_state["llm"]
+
+    agent_state["history"].append(HumanMessage(content=user_message))
+
+    # 历史超过阈值时压缩旧消息
+    agent_state["history"] = await maybe_compress_history(
+        agent_state["history"], llm, profile
+    )
+
+    # 每轮注入最新用户画像
+    messages_to_send = [_build_system_prompt(profile)] + agent_state["history"]
+
+    result = await agent_state["agent"].ainvoke({"messages": messages_to_send})
+
+    messages: list[BaseMessage] = result["messages"]
+    response_msg = next(
+        (m for m in reversed(messages) if isinstance(m, AIMessage)),
+        None,
+    )
+    response_text = response_msg.content if response_msg else "Sorry, I could not generate a response."
+
+    agent_state["history"].append(AIMessage(content=response_text))
+
+    # 异步提取偏好，不阻塞回复返回
+    asyncio.create_task(
+        extract_and_save_preferences(user_message, response_text, llm, profile)
+    )
+
+    return response_text

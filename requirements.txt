@@ -1,5 +1,11 @@
-llama-index-core
-llama-index-llms-openai-like
+langchain-core
+langchain-openai
+langchain-community
+langchain-text-splitters
+langgraph
+faiss-cpu
+pypdf
+sentence-transformers
 streamlit
 requests
 python-dotenv
