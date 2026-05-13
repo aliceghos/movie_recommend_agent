@@ -1,17 +1,18 @@
 """
 基于 LangChain ReAct Agent + MiniMax LLM 的电影推荐 Agent。
-对外暴露 chat() 函数供 app.py 调用。
+对外暴露 chat()、chat_stream() 函数供 app.py 调用。
 """
 
 import asyncio
 import os
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent as _create_langchain_agent
 
+from movie_agent.callbacks import ToolDebugHandler, TokenTracker
 from movie_agent.memory import (
     extract_and_save_preferences,
     load_profile,
@@ -76,7 +77,7 @@ def _build_system_prompt(profile: dict[str, Any]) -> SystemMessage:
     return SystemMessage(content="\n".join(parts))
 
 
-def create_agent() -> dict[str, Any]:
+def create_agent_minimax() -> dict[str, Any]:
     """初始化 LangChain ReAct Agent，使用 MiniMax LLM 和 TMDB 工具集。
 
     Returns:
@@ -91,11 +92,13 @@ def create_agent() -> dict[str, Any]:
         model="MiniMax-M2.7",
         base_url="https://api.minimaxi.com/v1",
         api_key=api_key,
+        streaming=True,  # required for on_llm_new_token / on_chat_model_stream
+        temperature=0.7,
         http_client=httpx.Client(headers={"GroupId": group_id}),
         http_async_client=httpx.AsyncClient(headers={"GroupId": group_id}),
     )
 
-    agent = create_react_agent(
+    agent = _create_langchain_agent(
         model=llm,
         tools=TOOLS,
     )
@@ -103,8 +106,47 @@ def create_agent() -> dict[str, Any]:
     return {"agent": agent, "history": [], "llm": llm, "profile": load_profile()}
 
 
-async def chat(agent_state: dict[str, Any], user_message: str) -> str:
-    """向 Agent 发送消息并返回文本回复，自动处理历史压缩和偏好提取。"""
+# Backward-compatible alias (used by app.py)
+create_agent = create_agent_minimax
+
+
+def _format_tool_input(raw: Any) -> str:
+    """Normalise tool input for display — dicts become compact JSON strings."""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        # If it's a dict with a single key whose value is a dict, unwrap it
+        # (e.g. {"search_movies": {"query": "..."}} → {"query": "..."})
+        if len(raw) == 1:
+            inner = next(iter(raw.values()))
+            if isinstance(inner, dict):
+                raw = inner
+        import json as _json
+        return _json.dumps(raw, ensure_ascii=False)
+    return str(raw)
+
+
+# ---------------------------------------------------------------------------
+# Streaming chat — yields events for progressive UI updates
+# ---------------------------------------------------------------------------
+
+async def chat_stream(
+    agent_state: dict[str, Any],
+    user_message: str,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Streaming version of chat().
+
+    Uses ``astream_events`` to yield tokens as they are generated, plus
+    tool-start / tool-end events for the debug panel.
+    Token usage is tracked via :class:`TokenTracker`.
+
+    Yields:
+        dict events:
+        - ``{"type": "token", "content": "..."}``
+        - ``{"type": "tool_start", "name": "...", "input": "..."}``
+        - ``{"type": "tool_end", "name": "...", "output": "..."}``
+        - ``{"type": "done", "response": "...", "token_usage": {...}, "tool_calls": [...]}``
+    """
     profile = agent_state["profile"]
     llm = agent_state["llm"]
 
@@ -118,20 +160,96 @@ async def chat(agent_state: dict[str, Any], user_message: str) -> str:
     # 每轮注入最新用户画像
     messages_to_send = [_build_system_prompt(profile)] + agent_state["history"]
 
-    result = await agent_state["agent"].ainvoke({"messages": messages_to_send})
+    tool_debug = ToolDebugHandler()
+    token_tracker = TokenTracker()
 
-    messages: list[BaseMessage] = result["messages"]
-    response_msg = next(
-        (m for m in reversed(messages) if isinstance(m, AIMessage)),
-        None,
-    )
-    response_text = response_msg.content if response_msg else "Sorry, I could not generate a response."
+    full_response = ""
+    # Keep the last LLMResult seen so we can extract usage even when the
+    # callback's on_llm_end doesn't fire (or llm_output is empty).
+    last_llm_result = None
 
-    agent_state["history"].append(AIMessage(content=response_text))
+    async for event in agent_state["agent"].astream_events(
+        {"messages": messages_to_send},
+        config={"callbacks": [tool_debug, token_tracker]},
+        version="v2",
+    ):
+        kind = event["event"]
+
+        if kind == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            if chunk.content:
+                full_response += chunk.content
+                yield {"type": "token", "content": chunk.content}
+
+        elif kind == "on_chat_model_end":
+            output = event["data"].get("output")
+            if output is not None:
+                last_llm_result = output
+
+            # Fallback: if streaming produced no tokens (e.g., provider doesn't
+            # support streaming), extract the full response from LLMResult.
+            if not full_response and hasattr(output, "generations"):
+                last_gen = output.generations[0][0]
+                msg = getattr(last_gen, "message", None)
+                if msg and msg.content:
+                    full_response = msg.content
+
+        elif kind == "on_tool_start":
+            # input may be a JSON string or a dict; normalise for display
+            raw_input = event["data"].get("input")
+            if isinstance(raw_input, dict):
+                raw_input = _format_tool_input(raw_input)
+            yield {
+                "type": "tool_start",
+                "name": event["name"],
+                "input": raw_input,
+            }
+
+        elif kind == "on_tool_end":
+            output = event["data"].get("output")
+            yield {
+                "type": "tool_end",
+                "name": event["name"],
+                "output": str(output)[:500] if output else "",
+            }
+
+    # --- If the callback never captured token usage, try last_llm_result ---
+    if not token_tracker.last_call and last_llm_result is not None:
+        usage = TokenTracker._extract_usage(last_llm_result)
+        if usage:
+            token_tracker.record_usage(
+                prompt_tokens=usage["prompt_tokens"],
+                completion_tokens=usage["completion_tokens"],
+            )
+
+    # 记录最终回复到历史
+    agent_state["history"].append(AIMessage(content=full_response))
 
     # 异步提取偏好，不阻塞回复返回
     asyncio.create_task(
-        extract_and_save_preferences(user_message, response_text, llm, profile)
+        extract_and_save_preferences(user_message, full_response, llm, profile)
     )
 
+    yield {
+        "type": "done",
+        "response": full_response,
+        "token_usage": token_tracker.last_call,
+        "tool_calls": tool_debug.calls,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming wrapper — backward-compatible, returns whole response as str
+# ---------------------------------------------------------------------------
+
+async def chat(agent_state: dict[str, Any], user_message: str) -> str:
+    """向 Agent 发送消息并返回文本回复。
+
+    内部调用 :func:`chat_stream`，收集所有 token 后返回完整字符串。
+    如需流式输出请直接使用 ``chat_stream()``。
+    """
+    response_text = ""
+    async for event in chat_stream(agent_state, user_message):
+        if event["type"] == "done":
+            response_text = event["response"]
     return response_text

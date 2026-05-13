@@ -22,6 +22,16 @@ st.set_page_config(
     layout="centered",
 )
 
+# --- Initialize cumulative token tracking in session state ---
+if "total_tokens" not in st.session_state:
+    st.session_state.total_tokens = 0
+if "total_prompt_tokens" not in st.session_state:
+    st.session_state.total_prompt_tokens = 0
+if "total_completion_tokens" not in st.session_state:
+    st.session_state.total_completion_tokens = 0
+if "llm_call_count" not in st.session_state:
+    st.session_state.llm_call_count = 0
+
 # --- 侧边栏 ---
 with st.sidebar:
     st.title("🎬 Movie Agent")
@@ -36,9 +46,28 @@ with st.sidebar:
     st.markdown("- Show me popular movies right now")
     st.markdown("- I'm in the mood for a funny romantic comedy")
     st.divider()
+
+    # -- Token usage stats --
+    st.markdown("**📊 Token Usage**")
+    if st.session_state.llm_call_count > 0:
+        st.markdown(
+            f"LLM calls: **{st.session_state.llm_call_count}**\n\n"
+            f"Prompt tokens: **{st.session_state.total_prompt_tokens}**\n\n"
+            f"Completion tokens: **{st.session_state.total_completion_tokens}**\n\n"
+            f"Total tokens: **{st.session_state.total_tokens}**"
+        )
+    else:
+        st.caption("No usage recorded yet.")
+
+    st.divider()
+
+    # -- User profile --
     st.markdown("**Your Profile**")
     _profile = load_profile()
-    _pref_keys = ("liked_genres", "disliked_genres", "liked_tones", "disliked_tones", "liked_movies", "disliked_movies")
+    _pref_keys = (
+        "liked_genres", "disliked_genres", "liked_tones", "disliked_tones",
+        "liked_movies", "disliked_movies",
+    )
     if not any(_profile.get(k) for k in _pref_keys):
         st.caption("No preferences recorded yet.")
     else:
@@ -56,10 +85,15 @@ with st.sidebar:
             st.markdown(f"Disliked: {', '.join(_profile['disliked_movies'])}")
         if _profile.get("last_updated"):
             st.caption(f"Updated: {_profile['last_updated'][:10]}")
+
     st.divider()
     if st.button("🗑️ Clear conversation"):
         st.session_state.messages = []
         st.session_state.agent_state = None
+        st.session_state.total_tokens = 0
+        st.session_state.total_prompt_tokens = 0
+        st.session_state.total_completion_tokens = 0
+        st.session_state.llm_call_count = 0
         st.rerun()
 
 # --- 检查必要的 API Key ---
@@ -84,8 +118,8 @@ if not api_key or not tmdb_key:
 # --- 初始化 Agent（每个 session 只创建一次）---
 if "agent_state" not in st.session_state or st.session_state.agent_state is None:
     try:
-        from movie_agent.agent import create_agent
-        st.session_state.agent_state = create_agent()
+        from movie_agent.agent import create_agent_minimax
+        st.session_state.agent_state = create_agent_minimax()
     except Exception as e:
         st.error(f"Failed to initialize agent: {e}")
         st.stop()
@@ -110,16 +144,82 @@ if user_input:
         st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
+        # -- placeholder for progressive streaming response text --
+        response_placeholder = st.empty()
+
+        # -- expandable panel showing tool-call debug traces --
+        tool_expander = st.expander("🔍 Show agent reasoning", expanded=False)
+        tool_placeholder = tool_expander.empty()
+
+        # -- placeholder for per-message token badge --
+        token_placeholder = st.empty()
+
+        async def _consume_stream() -> str:
+            """Consume ``chat_stream`` events and update UI placeholders."""
+            from movie_agent.agent import chat_stream
+
+            displayed_text = ""
+            tool_lines: list[str] = []
+            final_response = ""
+
             try:
-                from movie_agent.agent import chat
-                response = asyncio.run(chat(st.session_state.agent_state, user_input))
-            except Exception as e:
+                async for event in chat_stream(
+                    st.session_state.agent_state, user_input
+                ):
+                    etype = event["type"]
+
+                    if etype == "token":
+                        displayed_text += event["content"]
+                        response_placeholder.markdown(displayed_text + "▌")
+
+                    elif etype == "tool_start":
+                        name = event["name"]
+                        inp = str(event.get("input", ""))[:200]
+                        tool_lines.append(f"🔧 **{name}**\n> {inp}")
+                        tool_placeholder.markdown("\n\n".join(tool_lines))
+
+                    elif etype == "tool_end":
+                        if tool_lines:
+                            tool_lines[-1] = tool_lines[-1].replace("🔧", "✅")
+                            tool_placeholder.markdown("\n\n".join(tool_lines))
+
+                    elif etype == "done":
+                        final_response = event.get("response", displayed_text)
+                        # Final render without the blinking cursor
+                        response_placeholder.markdown(final_response)
+
+                        usage = event.get("token_usage", {})
+                        if usage:
+                            prompt_t = usage.get("prompt_tokens", 0)
+                            comp_t = usage.get("completion_tokens", 0)
+                            total_t = usage.get("total_tokens", 0)
+
+                            # Update cumulative session counters
+                            st.session_state.total_prompt_tokens += prompt_t
+                            st.session_state.total_completion_tokens += comp_t
+                            st.session_state.total_tokens += total_t
+                            st.session_state.llm_call_count += 1
+
+                            token_placeholder.caption(
+                                f"📊 This message: {prompt_t} prompt + {comp_t} "
+                                f"completion = **{total_t} tokens**"
+                            )
+
+                        # Collapse tool expander if no tools were called
+                        if not tool_lines:
+                            tool_expander.empty()
+
+            except Exception:
                 tb = traceback.format_exc()
                 print(f"[Agent Error]\n{tb}")
-                response = f"Sorry, something went wrong: {e}"
-                with st.expander("Error details (debug)"):
+                error_msg = f"Sorry, something went wrong."
+                response_placeholder.markdown(error_msg)
+                with tool_expander:
                     st.code(tb)
-        st.markdown(response)
+                final_response = error_msg
+
+            return final_response
+
+        response = asyncio.run(_consume_stream())
 
     st.session_state.messages.append({"role": "assistant", "content": response})
