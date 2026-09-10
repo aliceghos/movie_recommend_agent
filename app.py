@@ -37,7 +37,7 @@ with st.sidebar:
     st.title("🎬 Movie Agent")
     st.markdown(
         "A conversational movie recommendation assistant powered by "
-        "[Minimax](https://www.minimaxi.com/) and [TMDB](https://www.themoviedb.org/)."
+        "[DeepSeek](https://platform.deepseek.com/) and [TMDB](https://www.themoviedb.org/)."
     )
     st.divider()
     st.markdown("**Try asking:**")
@@ -97,8 +97,7 @@ with st.sidebar:
         st.rerun()
 
 # --- 检查必要的 API Key ---
-api_key = os.getenv("MINIMAX_API_KEY", "").strip()
-group_id = os.getenv("MINIMAX_GROUP_ID", "").strip()
+api_key = os.getenv("OPENAI_API_KEY", "").strip()
 tmdb_key = os.getenv("TMDB_API_KEY", "").strip()
 
 if not api_key or not tmdb_key:
@@ -106,7 +105,8 @@ if not api_key or not tmdb_key:
     st.error("**Setup required** — one or more API keys are missing.")
     if not api_key:
         st.markdown(
-            "- **MINIMAX_API_KEY** — get yours at [minimaxi.com](https://www.minimaxi.com/)"
+            "- **OPENAI_API_KEY** — any OpenAI-compatible key; the default endpoint is "
+            "[platform.deepseek.com](https://platform.deepseek.com/)"
         )
     if not tmdb_key:
         st.markdown(
@@ -118,8 +118,8 @@ if not api_key or not tmdb_key:
 # --- 初始化 Agent（每个 session 只创建一次）---
 if "agent_state" not in st.session_state or st.session_state.agent_state is None:
     try:
-        from movie_agent.agent import create_agent_minimax
-        st.session_state.agent_state = create_agent_minimax()
+        from movie_agent.agent import create_agent_openai
+        st.session_state.agent_state = create_agent_openai()
     except Exception as e:
         st.error(f"Failed to initialize agent: {e}")
         st.stop()

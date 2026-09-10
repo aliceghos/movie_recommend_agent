@@ -39,10 +39,6 @@ class StreamingHandler(BaseCallbackHandler):
         return True
 
     @property
-    def ignore_tool(self) -> bool:
-        return True
-
-    @property
     def ignore_retriever(self) -> bool:
         return True
 
@@ -84,7 +80,10 @@ class ToolDebugHandler(BaseCallbackHandler):
 
     @property
     def ignore_agent(self) -> bool:
-        return True
+        # NOTE: langchain-core gates on_tool_start / on_tool_end / on_tool_error
+        # behind ``ignore_agent`` — there is no ``ignore_tool`` flag. Returning
+        # True here would silence every tool event this handler exists to record.
+        return False
 
     @property
     def ignore_retriever(self) -> bool:
@@ -106,7 +105,9 @@ class ToolDebugHandler(BaseCallbackHandler):
         self.calls.append({"name": name, "input": input_str, "output": None, "error": None})
 
     def on_tool_end(self, output: Any, **kwargs: Any) -> None:
-        output_str = str(output)
+        # langchain >= 1.0 hands back a ToolMessage; unwrap it so the recorded
+        # output is the tool's text rather than the message repr.
+        output_str = str(getattr(output, "content", output))
         if self.calls:
             self.calls[-1]["output"] = output_str
         truncated = output_str[:300] + ("..." if len(output_str) > 300 else "")
@@ -129,7 +130,7 @@ class TokenTracker(BaseCallbackHandler):
     """Tracks prompt / completion / total tokens across LLM calls.
 
     Probes multiple locations for token usage because different providers
-    (OpenAI, MiniMax, etc.) and different modes (streaming vs non-streaming)
+    (OpenAI, DeepSeek, etc.) and different modes (streaming vs non-streaming)
     store the data in different places:
 
     * ``llm_output["token_usage"]`` — standard non-streaming path
@@ -156,10 +157,6 @@ class TokenTracker(BaseCallbackHandler):
 
     @property
     def ignore_agent(self) -> bool:
-        return True
-
-    @property
-    def ignore_tool(self) -> bool:
         return True
 
     @property

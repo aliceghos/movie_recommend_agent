@@ -20,13 +20,15 @@ LangChain ReAct Agent  (LangGraph)
     └─ RAG Tool        → FAISS index over local reviews & genre articles
 ```
 
-The agent uses MiniMax's LLM (`MiniMax-M2.7`) and embedding model (`embo-01`) via an OpenAI-compatible API.
+The agent talks to any OpenAI-compatible chat endpoint — the default is DeepSeek
+(`deepseek-flash`). Swapping providers is a `.env` edit, no code change. Embeddings for RAG
+run locally via HuggingFace (`paraphrase-multilingual-MiniLM-L12-v2`).
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.12 (managed by [uv](https://docs.astral.sh/uv/))
 - A [TMDB API key](https://www.themoviedb.org/settings/api)
-- A [MiniMax API key and Group ID](https://www.minimaxi.com/)
+- An API key for any OpenAI-compatible provider (default: [DeepSeek](https://platform.deepseek.com/))
 
 ## Setup
 
@@ -35,8 +37,9 @@ The agent uses MiniMax's LLM (`MiniMax-M2.7`) and embedding model (`embo-01`) vi
 git clone <repo-url>
 cd movie_recommend_agent
 
-# 2. Install dependencies
-pip install -r requirements.txt
+# 2. Create the virtual environment and install dependencies
+uv venv --python 3.12
+uv pip install -r requirements.txt
 
 # 3. Configure environment variables
 cp .env.example .env
@@ -46,16 +49,31 @@ cp .env.example .env
 `.env` file:
 
 ```
-MINIMAX_API_KEY=your_minimax_api_key
-MINIMAX_GROUP_ID=your_minimax_group_id
+OPENAI_API_KEY=your_api_key
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-flash
 TMDB_API_KEY=your_tmdb_api_key
 PYTHONPATH=.
 ```
 
+Two optional escape hatches for restricted networks:
+
+| Variable | Use when |
+|----------|----------|
+| `TMDB_BASE_URL=https://api.tmdb.org/3` | `api.themoviedb.org` is unreachable (equivalent official domain) |
+| `HF_ENDPOINT=https://hf-mirror.com` | `huggingface.co` is unreachable — needed to download the embedding weights on first run |
+
 ## Running
 
 ```bash
+source .venv/bin/activate
 streamlit run app.py
+```
+
+Or without activating:
+
+```bash
+.venv/bin/streamlit run app.py
 ```
 
 Open your browser to `http://localhost:8501`.
@@ -96,9 +114,11 @@ movie_recommend_agent/
 | Package | Purpose |
 |---------|---------|
 | `streamlit` | Web UI |
-| `langchain-core` / `langchain-openai` / `langchain-community` | LangChain framework |
+| `langchain` / `langchain-core` / `langchain-openai` / `langchain-community` | LangChain framework |
 | `langgraph` | ReAct agent orchestration |
 | `faiss-cpu` | Vector similarity search |
+| `sentence-transformers` | Local embedding model for RAG |
+| `pypdf` | Film art book (PDF) parsing |
 | `requests` | TMDB HTTP calls |
 | `python-dotenv` | Environment variable loading |
 

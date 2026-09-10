@@ -7,7 +7,13 @@ import os
 import requests
 from typing import List, Optional, Dict
 
-BASE_URL = "https://api.themoviedb.org/3"
+DEFAULT_BASE_URL = "https://api.themoviedb.org/3"
+
+
+def _base_url() -> str:
+    """TMDB 接口地址。api.themoviedb.org 不可达时可通过 TMDB_BASE_URL
+    改用等价域名 https://api.tmdb.org/3。"""
+    return os.getenv("TMDB_BASE_URL") or DEFAULT_BASE_URL
 
 
 def _get_api_key() -> str:
@@ -21,7 +27,7 @@ def _get(endpoint: str, params: Optional[Dict] = None) -> Dict:
     params = params or {}
     params["api_key"] = _get_api_key()
     params.setdefault("language", "en-US")
-    response = requests.get(f"{BASE_URL}{endpoint}", params=params, timeout=10)
+    response = requests.get(f"{_base_url()}{endpoint}", params=params, timeout=10)
     response.raise_for_status()
     return response.json()
 

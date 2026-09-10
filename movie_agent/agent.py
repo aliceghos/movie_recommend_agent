@@ -1,5 +1,5 @@
 """
-基于 LangChain ReAct Agent + MiniMax LLM 的电影推荐 Agent。
+基于 LangChain ReAct Agent + OpenAI 兼容接口（默认 DeepSeek）的电影推荐 Agent。
 对外暴露 chat()、chat_stream() 函数供 app.py 调用。
 """
 
@@ -7,7 +7,6 @@ import asyncio
 import os
 from typing import Any, AsyncGenerator
 
-import httpx
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent as _create_langchain_agent
@@ -77,25 +76,30 @@ def _build_system_prompt(profile: dict[str, Any]) -> SystemMessage:
     return SystemMessage(content="\n".join(parts))
 
 
-def create_agent_minimax() -> dict[str, Any]:
-    """初始化 LangChain ReAct Agent，使用 MiniMax LLM 和 TMDB 工具集。
+# 默认指向 DeepSeek，但配置项是通用的 —— 换成任何 OpenAI 兼容的网关/厂商
+# 只需改 .env 里的 OPENAI_BASE_URL 与 OPENAI_MODEL。
+DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
+DEFAULT_MODEL = "deepseek-flash"
+
+
+def create_agent_openai() -> dict[str, Any]:
+    """初始化 LangChain ReAct Agent，使用 OpenAI 兼容的 LLM 和 TMDB 工具集。
 
     Returns:
         包含 'agent'、'history'、'llm'、'profile' 的字典，供 chat() 跨轮次使用。
     """
-    api_key = os.getenv("MINIMAX_API_KEY", "")
-    group_id = os.getenv("MINIMAX_GROUP_ID", "")
-    if not api_key or not group_id:
-        raise ValueError("MINIMAX_API_KEY and MINIMAX_GROUP_ID must be set.")
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY must be set.")
 
     llm = ChatOpenAI(
-        model="MiniMax-M2.7",
-        base_url="https://api.minimaxi.com/v1",
+        model=os.getenv("OPENAI_MODEL") or DEFAULT_MODEL,
+        base_url=os.getenv("OPENAI_BASE_URL") or DEFAULT_BASE_URL,
         api_key=api_key,
         streaming=True,  # required for on_llm_new_token / on_chat_model_stream
         temperature=0.7,
-        http_client=httpx.Client(headers={"GroupId": group_id}),
-        http_async_client=httpx.AsyncClient(headers={"GroupId": group_id}),
+        # DeepSeek 等兼容网关的流式响应默认不带 usage，显式开启以便统计 token
+        stream_usage=True,
     )
 
     agent = _create_langchain_agent(
@@ -107,7 +111,7 @@ def create_agent_minimax() -> dict[str, Any]:
 
 
 # Backward-compatible alias (used by app.py)
-create_agent = create_agent_minimax
+create_agent = create_agent_openai
 
 
 def _format_tool_input(raw: Any) -> str:

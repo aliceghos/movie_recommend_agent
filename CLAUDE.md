@@ -24,7 +24,7 @@ LangChain ReAct Agent (LangGraph)
 | `movie_agent/agent.py` | ReAct agent init and async `chat()` loop |
 | `movie_agent/tools.py` | 7 LangChain `@tool` definitions |
 | `movie_agent/tmdb_client.py` | TMDB REST API wrapper |
-| `movie_agent/rag.py` | FAISS-based RAG with MiniMax embeddings |
+| `movie_agent/rag.py` | FAISS-based RAG with local HuggingFace embeddings |
 | `data/reviews/` | Movie review documents (excluded from git) |
 | `data/knowledge/` | Genre knowledge articles in Chinese (excluded from git) |
 | `data/books/` | Film art book PDFs (excluded from git) |
@@ -35,23 +35,33 @@ LangChain ReAct Agent (LangGraph)
 Required in `.env`:
 
 ```
-MINIMAX_API_KEY=<key>
-MINIMAX_GROUP_ID=<group_id>
+OPENAI_API_KEY=<key>
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-flash
 TMDB_API_KEY=<key>
 PYTHONPATH=.
+```
+
+Optional, for restricted networks:
+
+```
+TMDB_BASE_URL=https://api.tmdb.org/3   # when api.themoviedb.org is unreachable
+HF_ENDPOINT=https://hf-mirror.com      # when huggingface.co is unreachable
 ```
 
 ## Running the Project
 
 ```bash
-pip install -r requirements.txt
-streamlit run app.py
+uv venv --python 3.12
+uv pip install -r requirements.txt
+.venv/bin/streamlit run app.py
 ```
 
 ## External APIs
 
-- **TMDB**: Movie search, details, recommendations, discovery, genres — base URL `https://api.themoviedb.org/3`
-- **MiniMax**: LLM inference (`MiniMax-M2.7`) and embeddings (`embo-01`) via OpenAI-compatible endpoint `https://api.minimaxi.com/v1`; requires `GroupId` header from `MINIMAX_GROUP_ID`
+- **TMDB**: Movie search, details, recommendations, discovery, genres — base URL `https://api.themoviedb.org/3`, overridable via `TMDB_BASE_URL`
+- **LLM**: any OpenAI-compatible endpoint, configured entirely through `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`. Default is DeepSeek (`https://api.deepseek.com/v1`, models `deepseek-flash` and `deepseek-v4-pro`). `stream_usage=True` is required for token accounting under streaming.
+- **Embeddings**: run locally via `sentence-transformers` (`paraphrase-multilingual-MiniLM-L12-v2`), no API call
 
 ## RAG Details
 
@@ -76,3 +86,6 @@ streamlit run app.py
 - Tools format output as plain text strings (not JSON) for direct agent consumption
 - The agent system prompt instructs including TMDB URLs in responses
 - Async: agent uses `ainvoke()`; Streamlit bridges with `asyncio.run()`
+- Callbacks: langchain-core gates **all** tool events (`on_tool_start/end/error`) behind
+  `ignore_agent`; there is no `ignore_tool` flag. A tool-observing handler must return
+  `False` from `ignore_agent`.
