@@ -1,14 +1,20 @@
 """
 Middleware 装配层 —— Agent 的横切关注点。
 
-四件事各自挂在 LangChain 1.x 的一个原生扩展点上，而不是塞进 ``chat_stream`` 手写：
+五件事各自挂在 LangChain 1.x 的一个原生扩展点上，而不是塞进 ``chat_stream`` 手写：
 
-    dynamic_prompt   每轮把长期画像 + Skill 索引 + 相关情节记忆注入 system prompt
-    after_agent      一轮结束后把偏好与情节摘要写回长期记忆
-    Summarization    历史超阈值时压缩（框架内置）
-    ToolSelector     工具超过 20 个时先筛后调（框架内置）
+    ToolAuthorization  按角色授权工具 + 路径钉入每用户沙箱（见 ``authz.py``）
+    dynamic_prompt     每轮把长期画像 + Skill 索引 + 相关情节记忆注入 system prompt
+    after_agent        一轮结束后把偏好与情节摘要写回长期记忆
+    Summarization      历史超阈值时压缩（框架内置）
+    ToolSelector       工具超过阈值时先筛后调（框架内置）
 
-前两个是本文件实现的；后两个在 ``build_middleware`` 里配置。
+**授权必须排在链首**：它是最外层，先于 ToolSelector 看到工具表，也先于任何
+工具真正执行。
+
+**记忆的 uid 从 ``runtime.context`` 取**（见 ``context.py``）。取不到就整段跳过
+记忆读写，而不是回落到任何默认身份 —— 宁可丢这一轮的个性化，也不能把 A 的
+画像读给 B。
 
 **为什么记忆写入必须挂在 ``after_agent``**：改造前它是
 ``asyncio.create_task(extract_and_save_preferences(...))``，而 Streamlit 每轮用
@@ -22,6 +28,7 @@ Middleware 装配层 —— Agent 的横切关注点。
 import json
 import sys
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware import (
@@ -34,6 +41,7 @@ from langchain.agents.middleware import (
 )
 from langchain_core.messages import AIMessage, HumanMessage
 
+from movie_agent.authz import ToolAuthorizationMiddleware
 from movie_agent.llm import get_utility_llm
 from movie_agent.skills import skill_index_prompt
 from movie_agent.store import (
@@ -118,12 +126,20 @@ def _last_human_text(messages: list[Any]) -> str:
     return ""
 
 
+def _context_uid(runtime: Any) -> str | None:
+    """从 runtime.context 取 user_id。取不到返回 None，由调用方跳过记忆。"""
+    context = getattr(runtime, "context", None)
+    uid = getattr(context, "user_id", None)
+    return str(uid) if uid else None
+
+
 @dynamic_prompt
 async def memory_prompt(request: ModelRequest) -> str:
     """把长期记忆和 Skill 索引拼进 system prompt。
 
     每次模型调用都重跑，所以同一轮里 Skill 加载之后的后续调用也看得到最新画像。
     Store 不可用时静默退回基础 prompt —— 记忆是增强项，不该让对话失败。
+    没有 uid 也一样退回：宁可丢个性化，也不能读错人的画像。
     """
     parts = [BASE_SYSTEM_PROMPT]
 
@@ -136,16 +152,17 @@ async def memory_prompt(request: ModelRequest) -> str:
         parts.append(index)
 
     store = getattr(request.runtime, "store", None)
-    if store is not None:
+    uid = _context_uid(request.runtime)
+    if store is not None and uid:
         try:
-            profile = await aload_profile(store)
+            profile = await aload_profile(store, uid)
             rendered = _render_profile(profile)
             if rendered:
                 parts.append(rendered)
 
             query = _last_human_text(request.state["messages"])
             if query:
-                episodes = await recall_episodes(store, query, limit=2)
+                episodes = await recall_episodes(store, query, uid, limit=2)
                 if episodes:
                     parts.append(
                         "--- Relevant past exchanges ---\n"
@@ -195,9 +212,13 @@ async def persist_memory(state: dict[str, Any], runtime: Any) -> None:
 
     异常只记日志不上抛：记忆写失败不该让用户看到的回复变成报错。
     但和改造前不同，它**确实会被执行完**，失败也**确实会打出来**。
+
+    没有 uid 就不写。宁可丢这一轮的记忆，也不能把它写进一个共享命名空间；
+    store 层的 uid 已经是必填的，这里不拦也只是把 ValueError 换个地方抛。
     """
     store = getattr(runtime, "store", None)
-    if store is None:
+    uid = _context_uid(runtime)
+    if store is None or not uid:
         return
 
     user_text, reply = _last_exchange(state.get("messages", []))
@@ -205,7 +226,7 @@ async def persist_memory(state: dict[str, Any], runtime: Any) -> None:
         return
 
     try:
-        profile = await aload_profile(store)
+        profile = await aload_profile(store, uid)
         current = "\n".join(
             f"- {label}: {profile.get(key) or '[]'}"
             for key, label in _PROFILE_LABELS.items()
@@ -228,18 +249,18 @@ async def persist_memory(state: dict[str, Any], runtime: Any) -> None:
                     profile[key].append(value)
                     changed = True
         if changed:
-            await asave_profile(store, profile)
+            await asave_profile(store, profile, uid)
 
         episode = str(extracted.get("episode", "")).strip()
         if episode:
-            await add_episode(store, episode)
+            await add_episode(store, episode, uid)
 
     except Exception as exc:  # noqa: BLE001 - 边界层
         print(f"[memory] extraction failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
-# 3 + 4. 内置中间件的装配
+# 中间件链的装配
 # ---------------------------------------------------------------------------
 
 # 工具筛选的启用门槛。低于这个数就没有筛的必要，反而多花一次 LLM 调用。
@@ -251,9 +272,13 @@ MAX_TOOLS_PER_TURN = 6
 ALWAYS_AVAILABLE_TOOLS = ["load_skill"]
 
 
-def build_middleware(tool_count: int) -> list[AgentMiddleware]:
+def build_middleware(tool_count: int, watchlist_root: Path) -> list[AgentMiddleware]:
     """按工具规模装配中间件链。顺序即执行顺序。"""
     middleware: list[AgentMiddleware] = [
+        # 授权在最外层。换成其他位置也能拦住工具调用（awrap_tool_call 无论
+        # 如何都会过），但排在链首才能让 ToolSelector 看到的已经是过滤后的
+        # 工具表 —— 否则它会花一次 LLM 调用去筛一批用户根本无权调的工具。
+        ToolAuthorizationMiddleware(watchlist_root),
         SummarizationMiddleware(
             model=get_utility_llm(),
             trigger={"messages": 24},

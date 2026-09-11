@@ -4,41 +4,54 @@
 编排全部交给 LangChain 1.x 的 ``create_agent``：
 
     工具   = 本地工具 + MCP 工具（tmdb Server + watchlist Server），Server 挂了则补本地降级工具
-    记忆   = InMemorySaver（短期，按 thread_id）+ PersistentStore（长期，跨会话）
-    横切   = middleware 链（画像注入 / 记忆写回 / 历史压缩 / 工具筛选）
+    记忆   = checkpointer（短期，按 thread_id）+ store（长期，跳会话），两者由 server 注入
+    横切   = middleware 链（授权 / 画像注入 / 记忆写回 / 历史压缩 / 工具筛选）
+    身份   = ``context_schema=MovieAgentContext``，每请求现传
 
-对外只暴露 ``create_movie_agent()`` 与 ``chat_stream()``，供 app.py 调用。
+**从每会话一个改为进程级单例**。改造前每个 Streamlit session 都
+``create_movie_agent()`` 一次，每次都重拉 MCP 工具表、重建 LLM 客户端。现在
+装配只在 ``server/main.py`` 的 lifespan 里做一次，跟用户无关的东西（工具、
+模型、中间件）全部共享；跟用户有关的只有两样，都每请求传：
 
-**Checkpointer 为何是 InMemorySaver**：Streamlit 每次 rerun 都 ``asyncio.run()``
-新建事件循环，连接型 checkpointer（AsyncSqliteSaver 之类）会绑定创建时的循环并
-在下一轮失效。放在 ``st.session_state`` 里的纯内存 saver 恰好等于「本次会话的
-短期记忆」，重启失忆是预期语义；跨会话该记住的东西全部走 Store。
+    thread_id  -> config["configurable"]，定位哪个会话的 checkpoint
+    context    -> MovieAgentContext，定位请求者是谁、权限如何
+
+因此 ``build_agent_runtime()`` **不再生成 thread_id**。它返回的东西里一个字节都
+不应该和具体用户绑定 —— 这是单例安全的前提。
 """
 
 import json
-import uuid
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 from langchain.agents import create_agent as _create_langchain_agent
 from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
 
 from movie_agent.callbacks import TokenTracker, ToolDebugHandler
+from movie_agent.context import MovieAgentContext
 from movie_agent.llm import get_chat_llm
 from movie_agent.mcp_client import failed_servers, load_mcp_tools_safe
 from movie_agent.middleware import build_middleware
 from movie_agent.skills import list_skills
-from movie_agent.store import get_store, load_profile
 from movie_agent.tools import LOCAL_TOOLS, TMDB_TOOLS
 
 
-async def create_movie_agent() -> dict[str, Any]:
-    """装配 Agent。
+async def build_agent_runtime(
+    checkpointer: Any,
+    store: Any,
+    watchlist_root: Path,
+) -> dict[str, Any]:
+    """装配进程级 Agent。在 lifespan 里调一次。
+
+    Args:
+        checkpointer: ``AsyncPostgresSaver``，已 ``setup()``。
+        store: ``AsyncPostgresStore``，已 ``setup()``。
+        watchlist_root: 沙箱根，每用户一个子目录。
 
     Returns:
-        ``agent`` / ``llm`` / ``checkpointer`` / ``store`` / ``thread_id`` /
-        ``warnings``（MCP 降级说明）/ ``tool_names`` / ``skills``。
-        注意这里**没有** ``history`` —— 消息历史由 checkpointer 按 thread_id 管理。
+        ``agent`` / ``llm`` / ``store`` / ``warnings``（MCP 降级说明）/
+        ``tools`` / ``tool_names`` / ``skills``。没有 ``thread_id``，也没有任何
+        用户相关的字段。
     """
     llm = get_chat_llm()
 
@@ -50,32 +63,24 @@ async def create_movie_agent() -> dict[str, Any]:
         tools += TMDB_TOOLS
         warnings.append("falling back to in-process TMDB tools")
 
-    store = get_store()
-    checkpointer = InMemorySaver()
-
     agent = _create_langchain_agent(
         model=llm,
         tools=tools,
-        middleware=build_middleware(len(tools)),
+        middleware=build_middleware(len(tools), watchlist_root),
         checkpointer=checkpointer,
         store=store,
+        context_schema=MovieAgentContext,
     )
 
     return {
         "agent": agent,
         "llm": llm,
-        "checkpointer": checkpointer,
         "store": store,
-        "thread_id": uuid.uuid4().hex,
         "warnings": warnings,
+        "tools": tools,
         "tool_names": [t.name for t in tools],
         "skills": [s.name for s in list_skills()],
     }
-
-
-def get_profile(agent_state: dict[str, Any]) -> dict[str, Any]:
-    """读当前长期画像（供 UI 展示）。"""
-    return load_profile(agent_state["store"])
 
 
 def _format_tool_input(raw: Any) -> str:
@@ -97,13 +102,19 @@ def _format_tool_input(raw: Any) -> str:
 # ---------------------------------------------------------------------------
 
 async def chat_stream(
-    agent_state: dict[str, Any],
+    runtime: dict[str, Any],
     user_message: str,
+    *,
+    thread_id: str,
+    context: MovieAgentContext,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """流式对话。
 
     只投递本轮的新消息，历史与 system prompt 分别由 checkpointer 和
     middleware 负责，这里不再手工拼装。
+
+    ``thread_id`` 与 ``context`` 必须由调用方显式传：``runtime`` 是全进程共享的
+    单例，身份不能从里面读。两个参数都是 keyword-only，避免位置传错。
 
     Yields:
         - ``{"type": "token", "content": "..."}``
@@ -119,12 +130,13 @@ async def chat_stream(
     # 用它做兜底提取。
     last_llm_result = None
 
-    async for event in agent_state["agent"].astream_events(
+    async for event in runtime["agent"].astream_events(
         {"messages": [HumanMessage(content=user_message)]},
         config={
-            "configurable": {"thread_id": agent_state["thread_id"]},
+            "configurable": {"thread_id": thread_id},
             "callbacks": [tool_debug, token_tracker],
         },
+        context=context,
         version="v2",
     ):
         kind = event["event"]
@@ -182,10 +194,18 @@ async def chat_stream(
 # Non-streaming wrapper — returns the whole response as str
 # ---------------------------------------------------------------------------
 
-async def chat(agent_state: dict[str, Any], user_message: str) -> str:
+async def chat(
+    runtime: dict[str, Any],
+    user_message: str,
+    *,
+    thread_id: str,
+    context: MovieAgentContext,
+) -> str:
     """向 Agent 发送消息并返回完整文本回复。"""
     response_text = ""
-    async for event in chat_stream(agent_state, user_message):
+    async for event in chat_stream(
+        runtime, user_message, thread_id=thread_id, context=context
+    ):
         if event["type"] == "done":
             response_text = event["response"]
     return response_text

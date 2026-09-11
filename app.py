@@ -1,79 +1,169 @@
-"""
-电影推荐 Agent 的 Streamlit 聊天界面。
+"""电影推荐 Agent 的 Streamlit 界面 —— 纯 HTTP 客户端。
 
 启动方式：
-    ./scripts/dev.sh            # 一并起 MCP Server（推荐）
-    streamlit run app.py        # 只起界面，TMDB 走本地降级工具
+    ./scripts/dev.sh                 # MCP Server + uvicorn + Streamlit 一起起
+    streamlit run app.py             # 只起界面，后端需另外起
 
-脚本执行顺序是刻意的：先建 Agent，再渲染对话，**最后**渲染侧边栏 ——
-侧边栏要显示的 token 累计与用户画像都是本轮对话产生的，写在前面会永远慢一轮。
+**这个文件不再 import ``movie_agent``**，也没有一个 ``asyncio.run()``。
+
+改造前它自己装配 agent，于是被 Streamlit 的事件循环亲和性钉死：每次 rerun 都
+新建再销毁一个 loop，数据库连接池活不下来，只能退回进程内状态（也就意味着单
+用户、重启失忆）。agent 移进 uvicorn 之后这个约束自然消失，UI 只剩三件事：
+拿 token、列会话、消费 SSE。
+
+渲染顺序仍然是「对话在前、侧边栏在后」：侧边栏要显示的画像和用量都是本轮对话
+产生的，写在前面会永远慢一轮。
 """
 
-import asyncio
-import os
-import traceback
+import uuid
 
 import streamlit as st
 from dotenv import load_dotenv
 
+from ui.api_client import ApiClient, ApiError, api_base, readyz
+
 load_dotenv()
 
-st.set_page_config(
-    page_title="Movie Recommendation Agent",
-    page_icon="🎬",
-    layout="centered",
-)
+st.set_page_config(page_title="Movie Recommendation Agent", page_icon="🎬", layout="centered")
 
-# --- 累计 token 统计 ---
-for _key in ("total_tokens", "total_prompt_tokens", "total_completion_tokens", "llm_call_count"):
-    st.session_state.setdefault(_key, 0)
+for _key, _default in (
+    ("access_token", None),
+    ("refresh_token", None),
+    ("user", None),
+    ("conversation", None),
+    ("messages", []),
+    ("last_usage", None),
+):
+    st.session_state.setdefault(_key, _default)
 
-# --- 检查必要的 API Key ---
-api_key = os.getenv("OPENAI_API_KEY", "").strip()
-tmdb_key = os.getenv("TMDB_API_KEY", "").strip()
 
-if not api_key or not tmdb_key:
+def client() -> ApiClient:
+    return ApiClient(st.session_state.access_token)
+
+
+def sign_out() -> None:
+    """登出。撤销 refresh token 后清空本地状态。
+
+    撤销失败也照样清本地 —— 用户点了登出就必须登出，服务端连不上不是留在登录
+    态的理由。
+    """
+    if st.session_state.refresh_token:
+        try:
+            client().logout(st.session_state.refresh_token)
+        except (ApiError, OSError):
+            pass
+    for key in ("access_token", "refresh_token", "user", "conversation", "messages", "last_usage"):
+        st.session_state[key] = None
+    st.session_state.messages = []
+
+
+# ---------------------------------------------------------------------------
+# 后端可用性
+# ---------------------------------------------------------------------------
+
+ready, detail = readyz()
+if not ready:
     st.title("🎬 Movie Recommendation Agent")
-    st.error("**Setup required** — one or more API keys are missing.")
-    if not api_key:
-        st.markdown(
-            "- **OPENAI_API_KEY** — any OpenAI-compatible key; the default endpoint is "
-            "[platform.deepseek.com](https://platform.deepseek.com/)"
-        )
-    if not tmdb_key:
-        st.markdown(
-            "- **TMDB_API_KEY** — get yours at "
-            "[themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)"
-        )
-    st.markdown("Add both keys to your `.env` file, then restart the app.")
+    st.error(f"**Backend not ready** — {detail}")
+    st.markdown(
+        f"界面只是客户端，agent 跑在 `{api_base()}`。用 `./scripts/dev.sh` 起全栈，"
+        "或单独起 `uvicorn server.main:app`。"
+    )
+    if st.button("Retry"):
+        st.rerun()
     st.stop()
 
-# --- 初始化 Agent（每个 session 只创建一次）---
-# create_movie_agent 是 async 的：它要 await MCP Server 的工具清单。
-if st.session_state.get("agent_state") is None:
-    try:
-        from movie_agent.agent import create_movie_agent
 
-        with st.spinner("Connecting to MCP servers, loading index and skills..."):
-            st.session_state.agent_state = asyncio.run(create_movie_agent())
-    except Exception as exc:
-        st.title("🎬 Movie Recommendation Agent")
-        st.error(f"Failed to initialize agent: {exc}")
-        st.code(traceback.format_exc())
-        st.stop()
+# ---------------------------------------------------------------------------
+# 登录 / 注册
+# ---------------------------------------------------------------------------
 
-agent_state = st.session_state.agent_state
-st.session_state.setdefault("messages", [])
+if not st.session_state.access_token:
+    st.title("🎬 Movie Recommendation Agent")
+    st.caption("Sign in — 会话历史与长期画像都按账号隔离。")
 
-# --- 页面标题 ---
+    login_tab, register_tab = st.tabs(["Sign in", "Register"])
+
+    with login_tab:
+        with st.form("login"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            if st.form_submit_button("Sign in"):
+                try:
+                    tokens = ApiClient().login(email, password)
+                    st.session_state.access_token = tokens["access_token"]
+                    st.session_state.refresh_token = tokens["refresh_token"]
+                    st.session_state.user = client().me()
+                    st.rerun()
+                except ApiError as exc:
+                    st.error(exc.message)
+
+    with register_tab:
+        with st.form("register"):
+            new_email = st.text_input("Email", key="reg_email")
+            new_password = st.text_input(
+                "Password", type="password", key="reg_password", help="至少 8 位"
+            )
+            if st.form_submit_button("Create account"):
+                try:
+                    ApiClient().register(new_email, new_password)
+                    st.success("Account created — switch to the Sign in tab.")
+                except ApiError as exc:
+                    st.error(exc.message)
+
+    st.stop()
+
+
+api = client()
+
+# ---------------------------------------------------------------------------
+# 会话选择
+# ---------------------------------------------------------------------------
+
+try:
+    conversations = api.list_conversations()
+except ApiError as exc:
+    if exc.status == 401:
+        # access token 15 分钟就过期，这里不静默续期：让用户重新登录一次，
+        # 比在 UI 里维护一套 refresh 竞态更可靠。
+        sign_out()
+        st.warning("Session expired — please sign in again.")
+        st.rerun()
+    st.error(exc.message)
+    st.stop()
+
+if st.session_state.conversation is None:
+    if conversations:
+        st.session_state.conversation = conversations[0]
+    else:
+        st.session_state.conversation = api.create_conversation()
+        conversations = [st.session_state.conversation]
+
+conversation = st.session_state.conversation
+
 st.title("🎬 Movie Recommendation Agent")
 
-# --- 显示历史消息 ---
+# 切换会话后要把历史从服务端重新拉一遍（``messages`` 表，不是 checkpoint）
+if st.session_state.get("loaded_conversation") != conversation["id"]:
+    try:
+        history = api.list_messages(conversation["id"])
+    except ApiError as exc:
+        st.error(exc.message)
+        history = []
+    st.session_state.messages = [
+        {"role": m["role"], "content": m["content"]} for m in history
+    ]
+    st.session_state.loaded_conversation = conversation["id"]
+
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# --- 聊天输入框 ---
+
+# ---------------------------------------------------------------------------
+# 发消息
+# ---------------------------------------------------------------------------
+
 user_input = st.chat_input("Ask me about movies...")
 
 if user_input:
@@ -83,88 +173,118 @@ if user_input:
 
     with st.chat_message("assistant"):
         response_placeholder = st.empty()
-
         tool_expander = st.expander("🔍 Show agent reasoning", expanded=False)
         tool_placeholder = tool_expander.empty()
-
         token_placeholder = st.empty()
 
-        async def _consume_stream() -> str:
-            """Consume ``chat_stream`` events and update UI placeholders."""
-            from movie_agent.agent import chat_stream
+        displayed = ""
+        tool_lines: list[str] = []
+        final_response = ""
 
-            displayed_text = ""
-            tool_lines: list[str] = []
-            final_response = ""
+        try:
+            events = api.send_message(
+                conversation["id"],
+                user_input,
+                # 每次发送一个新 key。Streamlit 在网络抖动时会重跑脚本，
+                # 没有这个 key 的话重跑就是重新烧一遍 token。
+                idempotency_key=uuid.uuid4().hex,
+            )
+            for event in events:
+                kind, data = event["event"], event["data"]
 
-            try:
-                async for event in chat_stream(agent_state, user_input):
-                    etype = event["type"]
+                if kind == "token":
+                    displayed += data.get("content", "")
+                    response_placeholder.markdown(displayed + "▌")
 
-                    if etype == "token":
-                        displayed_text += event["content"]
-                        response_placeholder.markdown(displayed_text + "▌")
+                elif kind == "tool_start":
+                    tool_lines.append(f"🔧 **{data['name']}**\n> {str(data.get('input', ''))[:200]}")
+                    tool_placeholder.markdown("\n\n".join(tool_lines))
 
-                    elif etype == "tool_start":
-                        name = event["name"]
-                        inp = str(event.get("input", ""))[:200]
-                        tool_lines.append(f"🔧 **{name}**\n> {inp}")
+                elif kind == "tool_end":
+                    if tool_lines:
+                        tool_lines[-1] = tool_lines[-1].replace("🔧", "✅")
                         tool_placeholder.markdown("\n\n".join(tool_lines))
 
-                    elif etype == "tool_end":
-                        if tool_lines:
-                            tool_lines[-1] = tool_lines[-1].replace("🔧", "✅")
-                            tool_placeholder.markdown("\n\n".join(tool_lines))
+                elif kind == "done":
+                    final_response = data.get("response") or displayed
+                    response_placeholder.markdown(final_response)
+                    usage = data.get("token_usage")
+                    if usage:
+                        st.session_state.last_usage = usage
+                        token_placeholder.caption(
+                            f"📊 This message: {usage.get('prompt_tokens', 0)} prompt + "
+                            f"{usage.get('completion_tokens', 0)} completion = "
+                            f"**{usage.get('total_tokens', 0)} tokens**"
+                        )
+                    if not tool_lines:
+                        tool_expander.empty()
 
-                    elif etype == "done":
-                        final_response = event.get("response", displayed_text)
-                        # Final render without the blinking cursor
-                        response_placeholder.markdown(final_response)
+                elif kind == "error":
+                    # 流内错误：状态码早就发走了，只能作为事件到达。
+                    final_response = displayed or "Sorry, something went wrong."
+                    response_placeholder.markdown(final_response)
+                    st.error(f"{data.get('code')}: {data.get('message')}")
 
-                        usage = event.get("token_usage", {})
-                        if usage:
-                            prompt_t = usage.get("prompt_tokens", 0)
-                            comp_t = usage.get("completion_tokens", 0)
-                            total_t = usage.get("total_tokens", 0)
+        except ApiError as exc:
+            final_response = "Sorry, the request was rejected."
+            response_placeholder.markdown(final_response)
+            st.error(exc.message)
+        except OSError as exc:
+            final_response = "Sorry, the connection dropped."
+            response_placeholder.markdown(final_response)
+            st.error(f"{type(exc).__name__}: {exc}")
 
-                            st.session_state.total_prompt_tokens += prompt_t
-                            st.session_state.total_completion_tokens += comp_t
-                            st.session_state.total_tokens += total_t
-                            st.session_state.llm_call_count += 1
+    st.session_state.messages.append({"role": "assistant", "content": final_response})
 
-                            token_placeholder.caption(
-                                f"📊 This message: {prompt_t} prompt + {comp_t} "
-                                f"completion = **{total_t} tokens**"
-                            )
-
-                        if not tool_lines:
-                            tool_expander.empty()
-
-            except Exception:
-                tb = traceback.format_exc()
-                print(f"[Agent Error]\n{tb}")
-                error_msg = "Sorry, something went wrong."
-                response_placeholder.markdown(error_msg)
-                with tool_expander:
-                    st.code(tb)
-                final_response = error_msg
-
-            return final_response
-
-        response = asyncio.run(_consume_stream())
-
-    st.session_state.messages.append({"role": "assistant", "content": response})
 
 # ---------------------------------------------------------------------------
-# 侧边栏 —— 放在最后渲染，读到的是本轮对话之后的状态
+# 侧边栏 —— 最后渲染，读到的是本轮对话之后的状态
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.title("🎬 Movie Agent")
-    st.markdown(
-        "Conversational movie recommendations, built on LangChain + LangGraph with "
-        "MCP tools, hybrid RAG, agent skills, and two-tier memory."
-    )
+    user = st.session_state.user or {}
+    st.caption(f"Signed in as **{user.get('email', '?')}** ({user.get('role', 'user')})")
+    if st.button("Sign out"):
+        sign_out()
+        st.rerun()
+    st.divider()
+
+    # -- 会话 --
+    st.markdown("**💬 Conversations**")
+    if st.button("➕ New conversation"):
+        try:
+            st.session_state.conversation = api.create_conversation()
+            st.session_state.messages = []
+            st.session_state.loaded_conversation = None
+            st.rerun()
+        except ApiError as exc:
+            st.error(exc.message)
+
+    labels = {c["id"]: (c["title"] or "Untitled")[:40] for c in conversations}
+    if labels:
+        ids = list(labels)
+        current = conversation["id"] if conversation["id"] in labels else ids[0]
+        picked = st.radio(
+            "Pick one",
+            ids,
+            index=ids.index(current),
+            format_func=lambda cid: labels[cid],
+            label_visibility="collapsed",
+        )
+        if picked != conversation["id"]:
+            st.session_state.conversation = next(c for c in conversations if c["id"] == picked)
+            st.rerun()
+
+        if st.button("🗑️ Delete this conversation"):
+            try:
+                api.delete_conversation(conversation["id"])
+                st.session_state.conversation = None
+                st.session_state.messages = []
+                st.session_state.loaded_conversation = None
+                st.rerun()
+            except ApiError as exc:
+                st.error(exc.message)
     st.divider()
 
     st.markdown("**Try asking:**")
@@ -174,63 +294,62 @@ with st.sidebar:
     st.markdown("- Add Blade Runner to my watchlist")
     st.divider()
 
-    # -- 能力装配状态 --
+    # -- 能力装配状态（服务端自述，不是 UI 猜的）--
     st.markdown("**🔌 Capabilities**")
-    warnings = agent_state.get("warnings", [])
-    if warnings:
-        st.warning("MCP degraded:\n" + "\n".join(f"- {w}" for w in warnings))
-    else:
-        st.caption("MCP: tmdb + watchlist servers connected")
-    st.caption(f"Tools available: {len(agent_state.get('tool_names', []))}")
-    skills = agent_state.get("skills", [])
-    st.caption("Skills: " + (", ".join(skills) if skills else "none loaded"))
-    st.divider()
-
-    # -- Token 用量 --
-    st.markdown("**📊 Token Usage**")
-    if st.session_state.llm_call_count > 0:
-        st.markdown(
-            f"LLM calls: **{st.session_state.llm_call_count}**\n\n"
-            f"Prompt tokens: **{st.session_state.total_prompt_tokens}**\n\n"
-            f"Completion tokens: **{st.session_state.total_completion_tokens}**\n\n"
-            f"Total tokens: **{st.session_state.total_tokens}**"
-        )
-    else:
-        st.caption("No usage recorded yet.")
-    st.divider()
-
-    # -- 长期画像（来自 Store，跨会话存活）--
-    st.markdown("**🧠 Long-term Profile**")
     try:
-        from movie_agent.agent import get_profile
-        from movie_agent.store import PREFERENCE_KEYS
+        caps = api.capabilities()
+        if caps["warnings"]:
+            st.warning("MCP degraded:\n" + "\n".join(f"- {w}" for w in caps["warnings"]))
+        else:
+            st.caption("MCP: tmdb + watchlist servers connected")
+        st.caption(f"Tools available: {caps['tool_count']}")
+        st.caption("Skills: " + (", ".join(caps["skills"]) or "none loaded"))
+        st.caption(f"Model: {caps['model']}")
+    except ApiError as exc:
+        st.caption(f"Capabilities unavailable: {exc.message}")
+    st.divider()
 
-        profile = get_profile(agent_state)
-        labels = {
-            "liked_genres": "Genres you like",
-            "disliked_genres": "Genres you avoid",
-            "liked_tones": "Tones you enjoy",
-            "disliked_tones": "Tones you avoid",
-            "liked_movies": "Enjoyed",
-            "disliked_movies": "Disliked",
-        }
-        if not any(profile.get(k) for k in PREFERENCE_KEYS):
+    # -- Token 用量（服务端 usage_records 的真实汇总）--
+    st.markdown("**📊 Token Usage**")
+    try:
+        usage = api.usage()
+        if usage["request_count"]:
+            st.markdown(
+                f"Requests (30d): **{usage['request_count']}**\n\n"
+                f"Prompt tokens: **{usage['prompt_tokens']}**\n\n"
+                f"Completion tokens: **{usage['completion_tokens']}**\n\n"
+                f"Total tokens: **{usage['total_tokens']}**"
+            )
+        else:
+            st.caption("No usage recorded yet.")
+    except ApiError as exc:
+        st.caption(f"Usage unavailable: {exc.message}")
+    st.divider()
+
+    # -- 长期画像（跨会话存活）--
+    st.markdown("**🧠 Long-term Profile**")
+    labels_map = {
+        "liked_genres": "Genres you like",
+        "disliked_genres": "Genres you avoid",
+        "liked_tones": "Tones you enjoy",
+        "disliked_tones": "Tones you avoid",
+        "liked_movies": "Enjoyed",
+        "disliked_movies": "Disliked",
+    }
+    try:
+        profile = api.profile()
+        if not any(profile.get(k) for k in labels_map):
             st.caption("No preferences recorded yet.")
         else:
-            for key, label in labels.items():
+            for key, label in labels_map.items():
                 if profile.get(key):
                     st.markdown(f"{label}: {', '.join(profile[key])}")
             if profile.get("last_updated"):
                 st.caption(f"Updated: {profile['last_updated'][:10]}")
-    except Exception as exc:
-        st.caption(f"Profile unavailable: {exc}")
 
-    st.divider()
-    if st.button("🗑️ Clear conversation"):
-        # 只清短期记忆：换一个 thread_id 就等于开新会话，
-        # 长期画像留在 Store 里，这正是两层记忆的分工。
-        st.session_state.messages = []
-        st.session_state.agent_state = None
-        for key in ("total_tokens", "total_prompt_tokens", "total_completion_tokens", "llm_call_count"):
-            st.session_state[key] = 0
-        st.rerun()
+        if st.button("🧹 Clear my profile"):
+            # 只清画像。会话历史与情节记忆不受影响 —— 这正是两层记忆的分工。
+            api.clear_profile()
+            st.rerun()
+    except ApiError as exc:
+        st.caption(f"Profile unavailable: {exc.message}")

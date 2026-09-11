@@ -32,3 +32,6 @@ Thumbs.db
 
 # data
 data/
+
+# 学习笔记，不随仓库发布
+docs/

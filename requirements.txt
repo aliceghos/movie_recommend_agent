@@ -1,15 +1,45 @@
+# --- Agent 框架 ---
 langchain
 langchain-core
 langchain-openai
 langchain-community
 langchain-text-splitters
 langgraph
+langgraph-checkpoint-postgres
 langchain-mcp-adapters
 mcp
+
+# --- RAG ---
 faiss-cpu
 rank-bm25
 pypdf
 sentence-transformers
+
+# --- HTTP 服务 ---
+fastapi
+uvicorn[standard]
+sse-starlette
+
+# --- 数据库 ---
+# 驱动统一 psycopg3：langgraph-checkpoint-postgres 只支持它，
+# SQLAlchemy 用 postgresql+psycopg:// 对齐，避免两个驱动两个连接池
+sqlalchemy[asyncio]
+psycopg[binary,pool]
+alembic
+
+# --- 认证与配置 ---
+pydantic-settings
+# EmailStr 的校验后端。pydantic 不内置，缺了它 schema 一 import 就炸。
+email-validator
+pyjwt
+argon2-cffi
+
+# --- 客户端 / UI ---
 streamlit
+httpx
 requests
 python-dotenv
+
+# --- 测试 ---
+pytest
+pytest-asyncio

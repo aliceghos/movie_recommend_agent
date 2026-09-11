@@ -3,6 +3,7 @@ LangChain callback handlers: streaming output, tool debugging, and token trackin
 """
 
 import logging
+import time
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -63,11 +64,26 @@ class ToolDebugHandler(BaseCallbackHandler):
     """Prints every tool invocation (name + args + truncated output) for debugging.
 
     Set ``verbose`` to True to also print the full tool output.
+
+    Each recorded call carries ``duration_ms``. It is what gets persisted into
+    ``tool_invocations``: a slow MCP round-trip is the usual reason a reply feels
+    stuck, and without a per-tool timing there is no way to tell that apart from
+    a slow model.
+
+    Records are keyed by ``run_id``, not by arrival order. The model fires tool
+    calls in **parallel batches** (three ``on_tool_start`` before the first
+    ``on_tool_end`` is routine), so pairing each end event with "the call that
+    started last" silently mis-attributes it: the earlier calls of a batch keep
+    ``output=None`` forever, and the last one gets overwritten by another tool's
+    output with a duration timed from an unrelated start.
     """
 
     def __init__(self, verbose: bool = False) -> None:
         self.verbose = verbose
         self.calls: list[dict[str, Any]] = []  # record of all tool calls
+        # run_id -> (record, start time). Entries are popped on end/error, so a
+        # batch that finishes leaves nothing behind.
+        self._in_flight: dict[Any, tuple[dict[str, Any], float]] = {}
 
     # -- only listen to tool events ----------------------------------------
     @property
@@ -102,22 +118,49 @@ class ToolDebugHandler(BaseCallbackHandler):
         logger.info("%s  Args: %s", msg, input_str[:500])
         print(f"\n{msg}")
         print(f"  Args: {input_str[:500]}{'...' if len(input_str) > 500 else ''}")
-        self.calls.append({"name": name, "input": input_str, "output": None, "error": None})
+        record = {
+            "name": name,
+            "input": input_str,
+            "output": None,
+            "error": None,
+            "duration_ms": None,
+        }
+        self.calls.append(record)
+        self._in_flight[kwargs.get("run_id")] = (record, time.perf_counter())
+
+    def _finish(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any] | None, int | None]:
+        """Claim the record this end/error event belongs to, plus its elapsed ms.
+
+        Falls back to the most recent call when ``run_id`` is absent or unknown:
+        a mis-attributed timing is still better than dropping the invocation, and
+        the sequential case (which is what a missing run_id implies) is correct.
+        """
+        entry = self._in_flight.pop(kwargs.get("run_id"), None)
+        if entry is None:
+            record = self.calls[-1] if self.calls else None
+            return record, None
+        record, started = entry
+        return record, int((time.perf_counter() - started) * 1000)
 
     def on_tool_end(self, output: Any, **kwargs: Any) -> None:
         # langchain >= 1.0 hands back a ToolMessage; unwrap it so the recorded
         # output is the tool's text rather than the message repr.
         output_str = str(getattr(output, "content", output))
-        if self.calls:
-            self.calls[-1]["output"] = output_str
+        record, elapsed = self._finish(kwargs)
+        if record is not None:
+            record["output"] = output_str
+            record["duration_ms"] = elapsed
+        name = record["name"] if record else "unknown"
         truncated = output_str[:300] + ("..." if len(output_str) > 300 else "")
-        print(f"[TOOL END]   Output ({len(output_str)} chars): {truncated}")
+        print(f"[TOOL END]   {name} ({len(output_str)} chars, {elapsed} ms): {truncated}")
         if self.verbose:
             print(f"  Full output: {output_str}")
 
     def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
-        if self.calls:
-            self.calls[-1]["error"] = str(error)
+        record, elapsed = self._finish(kwargs)
+        if record is not None:
+            record["error"] = str(error)
+            record["duration_ms"] = elapsed
         logger.error("[TOOL ERROR] %s", error)
         print(f"[TOOL ERROR] {error}")
 
