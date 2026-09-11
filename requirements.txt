@@ -4,7 +4,10 @@ langchain-openai
 langchain-community
 langchain-text-splitters
 langgraph
+langchain-mcp-adapters
+mcp
 faiss-cpu
+rank-bm25
 pypdf
 sentence-transformers
 streamlit

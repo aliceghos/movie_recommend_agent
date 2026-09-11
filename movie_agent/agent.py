@@ -1,132 +1,94 @@
 """
-基于 LangChain ReAct Agent + OpenAI 兼容接口（默认 DeepSeek）的电影推荐 Agent。
-对外暴露 chat()、chat_stream() 函数供 app.py 调用。
+电影推荐 Agent 的装配入口。
+
+编排全部交给 LangChain 1.x 的 ``create_agent``：
+
+    工具   = 本地工具 + MCP 工具（tmdb Server + watchlist Server），Server 挂了则补本地降级工具
+    记忆   = InMemorySaver（短期，按 thread_id）+ PersistentStore（长期，跨会话）
+    横切   = middleware 链（画像注入 / 记忆写回 / 历史压缩 / 工具筛选）
+
+对外只暴露 ``create_movie_agent()`` 与 ``chat_stream()``，供 app.py 调用。
+
+**Checkpointer 为何是 InMemorySaver**：Streamlit 每次 rerun 都 ``asyncio.run()``
+新建事件循环，连接型 checkpointer（AsyncSqliteSaver 之类）会绑定创建时的循环并
+在下一轮失效。放在 ``st.session_state`` 里的纯内存 saver 恰好等于「本次会话的
+短期记忆」，重启失忆是预期语义；跨会话该记住的东西全部走 Store。
 """
 
-import asyncio
-import os
+import json
+import uuid
 from typing import Any, AsyncGenerator
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent as _create_langchain_agent
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
-from movie_agent.callbacks import ToolDebugHandler, TokenTracker
-from movie_agent.memory import (
-    extract_and_save_preferences,
-    load_profile,
-    maybe_compress_history,
-)
-from movie_agent.tools import TOOLS
-
-SYSTEM_PROMPT = """\
-You are a movie recommendation assistant. You have access to two types of tools:
-
-1. TMDB tools — for real-time movie data:
-   search_movies, get_movie_details, get_recommendations, discover_movies,
-   get_popular_movies, get_genres
-
-2. Local knowledge base tool — for editorial content:
-   search_local_knowledge — searches curated movie reviews, genre articles, and film art books.
-   Use this when the user asks for critical opinions, review excerpts, background
-   on film genres (cyberpunk, film noir), or film art theory and filmmaking concepts.
-   Covered movies: Inception, Harry Potter and the Prisoner of Azkaban, Jane Eyre,
-   Spirited Away, Wuthering Heights.
-   Also contains film art book content for questions about cinematography,
-   directing techniques, or film theory.
-
-When you need to call a tool, reason step by step. After receiving tool results,
-continue reasoning until you have enough information to give a final answer.
-
-Always include the TMDB URL for each movie: https://www.themoviedb.org/movie/{movie_id}
-"""
+from movie_agent.callbacks import TokenTracker, ToolDebugHandler
+from movie_agent.llm import get_chat_llm
+from movie_agent.mcp_client import failed_servers, load_mcp_tools_safe
+from movie_agent.middleware import build_middleware
+from movie_agent.skills import list_skills
+from movie_agent.store import get_store, load_profile
+from movie_agent.tools import LOCAL_TOOLS, TMDB_TOOLS
 
 
-def _build_system_prompt(profile: dict[str, Any]) -> SystemMessage:
-    """组合基础 prompt 与用户画像，生成每轮对话的 SystemMessage。"""
-    parts = [SYSTEM_PROMPT]
-
-    has_prefs = any(
-        profile.get(k)
-        for k in (
-            "liked_genres", "disliked_genres",
-            "liked_tones", "disliked_tones",
-            "liked_movies", "disliked_movies",
-        )
-    )
-
-    if has_prefs or profile.get("conversation_summary"):
-        parts.append("\n--- User Profile (from long-term memory) ---")
-        if profile.get("liked_genres"):
-            parts.append(f"Liked genres: {', '.join(profile['liked_genres'])}")
-        if profile.get("disliked_genres"):
-            parts.append(f"Disliked genres: {', '.join(profile['disliked_genres'])}")
-        if profile.get("liked_tones"):
-            parts.append(f"Liked tones: {', '.join(profile['liked_tones'])}")
-        if profile.get("disliked_tones"):
-            parts.append(f"Disliked tones: {', '.join(profile['disliked_tones'])}")
-        if profile.get("liked_movies"):
-            parts.append(f"Movies the user has enjoyed: {', '.join(profile['liked_movies'])}")
-        if profile.get("disliked_movies"):
-            parts.append(f"Movies the user disliked: {', '.join(profile['disliked_movies'])}")
-        if profile.get("conversation_summary"):
-            parts.append(f"\nPrevious conversation summary:\n{profile['conversation_summary']}")
-        parts.append("\nUse this profile to personalize your recommendations.")
-
-    return SystemMessage(content="\n".join(parts))
-
-
-# 默认指向 DeepSeek，但配置项是通用的 —— 换成任何 OpenAI 兼容的网关/厂商
-# 只需改 .env 里的 OPENAI_BASE_URL 与 OPENAI_MODEL。
-DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
-DEFAULT_MODEL = "deepseek-flash"
-
-
-def create_agent_openai() -> dict[str, Any]:
-    """初始化 LangChain ReAct Agent，使用 OpenAI 兼容的 LLM 和 TMDB 工具集。
+async def create_movie_agent() -> dict[str, Any]:
+    """装配 Agent。
 
     Returns:
-        包含 'agent'、'history'、'llm'、'profile' 的字典，供 chat() 跨轮次使用。
+        ``agent`` / ``llm`` / ``checkpointer`` / ``store`` / ``thread_id`` /
+        ``warnings``（MCP 降级说明）/ ``tool_names`` / ``skills``。
+        注意这里**没有** ``history`` —— 消息历史由 checkpointer 按 thread_id 管理。
     """
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY must be set.")
+    llm = get_chat_llm()
 
-    llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL") or DEFAULT_MODEL,
-        base_url=os.getenv("OPENAI_BASE_URL") or DEFAULT_BASE_URL,
-        api_key=api_key,
-        streaming=True,  # required for on_llm_new_token / on_chat_model_stream
-        temperature=0.7,
-        # DeepSeek 等兼容网关的流式响应默认不带 usage，显式开启以便统计 token
-        stream_usage=True,
-    )
+    mcp_tools, warnings = await load_mcp_tools_safe()
+    tools = [*LOCAL_TOOLS, *mcp_tools]
+
+    # tmdb Server 不可达时补上本地实现，其余 Server 缺失只是少一块能力
+    if "tmdb" in failed_servers(warnings):
+        tools += TMDB_TOOLS
+        warnings.append("falling back to in-process TMDB tools")
+
+    store = get_store()
+    checkpointer = InMemorySaver()
 
     agent = _create_langchain_agent(
         model=llm,
-        tools=TOOLS,
+        tools=tools,
+        middleware=build_middleware(len(tools)),
+        checkpointer=checkpointer,
+        store=store,
     )
 
-    return {"agent": agent, "history": [], "llm": llm, "profile": load_profile()}
+    return {
+        "agent": agent,
+        "llm": llm,
+        "checkpointer": checkpointer,
+        "store": store,
+        "thread_id": uuid.uuid4().hex,
+        "warnings": warnings,
+        "tool_names": [t.name for t in tools],
+        "skills": [s.name for s in list_skills()],
+    }
 
 
-# Backward-compatible alias (used by app.py)
-create_agent = create_agent_openai
+def get_profile(agent_state: dict[str, Any]) -> dict[str, Any]:
+    """读当前长期画像（供 UI 展示）。"""
+    return load_profile(agent_state["store"])
 
 
 def _format_tool_input(raw: Any) -> str:
-    """Normalise tool input for display — dicts become compact JSON strings."""
+    """把工具入参整理成便于展示的一行。"""
     if isinstance(raw, str):
         return raw
     if isinstance(raw, dict):
-        # If it's a dict with a single key whose value is a dict, unwrap it
-        # (e.g. {"search_movies": {"query": "..."}} → {"query": "..."})
+        # {"search_movies": {"query": "..."}} → {"query": "..."}
         if len(raw) == 1:
             inner = next(iter(raw.values()))
             if isinstance(inner, dict):
                 raw = inner
-        import json as _json
-        return _json.dumps(raw, ensure_ascii=False)
+        return json.dumps(raw, ensure_ascii=False)
     return str(raw)
 
 
@@ -138,43 +100,31 @@ async def chat_stream(
     agent_state: dict[str, Any],
     user_message: str,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Streaming version of chat().
+    """流式对话。
 
-    Uses ``astream_events`` to yield tokens as they are generated, plus
-    tool-start / tool-end events for the debug panel.
-    Token usage is tracked via :class:`TokenTracker`.
+    只投递本轮的新消息，历史与 system prompt 分别由 checkpointer 和
+    middleware 负责，这里不再手工拼装。
 
     Yields:
-        dict events:
         - ``{"type": "token", "content": "..."}``
         - ``{"type": "tool_start", "name": "...", "input": "..."}``
         - ``{"type": "tool_end", "name": "...", "output": "..."}``
         - ``{"type": "done", "response": "...", "token_usage": {...}, "tool_calls": [...]}``
     """
-    profile = agent_state["profile"]
-    llm = agent_state["llm"]
-
-    agent_state["history"].append(HumanMessage(content=user_message))
-
-    # 历史超过阈值时压缩旧消息
-    agent_state["history"] = await maybe_compress_history(
-        agent_state["history"], llm, profile
-    )
-
-    # 每轮注入最新用户画像
-    messages_to_send = [_build_system_prompt(profile)] + agent_state["history"]
-
     tool_debug = ToolDebugHandler()
     token_tracker = TokenTracker()
 
     full_response = ""
-    # Keep the last LLMResult seen so we can extract usage even when the
-    # callback's on_llm_end doesn't fire (or llm_output is empty).
+    # 保留最后一个 LLMResult：回调的 on_llm_end 可能拿不到 usage，
+    # 用它做兜底提取。
     last_llm_result = None
 
     async for event in agent_state["agent"].astream_events(
-        {"messages": messages_to_send},
-        config={"callbacks": [tool_debug, token_tracker]},
+        {"messages": [HumanMessage(content=user_message)]},
+        config={
+            "configurable": {"thread_id": agent_state["thread_id"]},
+            "callbacks": [tool_debug, token_tracker],
+        },
         version="v2",
     ):
         kind = event["event"]
@@ -190,8 +140,7 @@ async def chat_stream(
             if output is not None:
                 last_llm_result = output
 
-            # Fallback: if streaming produced no tokens (e.g., provider doesn't
-            # support streaming), extract the full response from LLMResult.
+            # 流式没吐出 token（网关不支持流式）时，从 LLMResult 里取全文
             if not full_response and hasattr(output, "generations"):
                 last_gen = output.generations[0][0]
                 msg = getattr(last_gen, "message", None)
@@ -199,15 +148,10 @@ async def chat_stream(
                     full_response = msg.content
 
         elif kind == "on_tool_start":
-            # input may be a JSON string or a dict; normalise for display
             raw_input = event["data"].get("input")
             if isinstance(raw_input, dict):
                 raw_input = _format_tool_input(raw_input)
-            yield {
-                "type": "tool_start",
-                "name": event["name"],
-                "input": raw_input,
-            }
+            yield {"type": "tool_start", "name": event["name"], "input": raw_input}
 
         elif kind == "on_tool_end":
             output = event["data"].get("output")
@@ -217,7 +161,7 @@ async def chat_stream(
                 "output": str(output)[:500] if output else "",
             }
 
-    # --- If the callback never captured token usage, try last_llm_result ---
+    # 回调没抓到 usage 时用最后一个 LLMResult 补
     if not token_tracker.last_call and last_llm_result is not None:
         usage = TokenTracker._extract_usage(last_llm_result)
         if usage:
@@ -225,14 +169,6 @@ async def chat_stream(
                 prompt_tokens=usage["prompt_tokens"],
                 completion_tokens=usage["completion_tokens"],
             )
-
-    # 记录最终回复到历史
-    agent_state["history"].append(AIMessage(content=full_response))
-
-    # 异步提取偏好，不阻塞回复返回
-    asyncio.create_task(
-        extract_and_save_preferences(user_message, full_response, llm, profile)
-    )
 
     yield {
         "type": "done",
@@ -243,15 +179,11 @@ async def chat_stream(
 
 
 # ---------------------------------------------------------------------------
-# Non-streaming wrapper — backward-compatible, returns whole response as str
+# Non-streaming wrapper — returns the whole response as str
 # ---------------------------------------------------------------------------
 
 async def chat(agent_state: dict[str, Any], user_message: str) -> str:
-    """向 Agent 发送消息并返回文本回复。
-
-    内部调用 :func:`chat_stream`，收集所有 token 后返回完整字符串。
-    如需流式输出请直接使用 ``chat_stream()``。
-    """
+    """向 Agent 发送消息并返回完整文本回复。"""
     response_text = ""
     async for event in chat_stream(agent_state, user_message):
         if event["type"] == "done":
