@@ -35,3 +35,6 @@ data/
 
 # 学习笔记，不随仓库发布
 docs/
+
+# 本地一次性修复脚本，不入库
+scripts/fix_mojibake_filenames.py
