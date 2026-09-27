@@ -38,3 +38,6 @@ docs/
 
 # 本地一次性修复脚本，不入库
 scripts/fix_mojibake_filenames.py
+
+# Windows 本地启动脚本，不入库
+scripts/dev_win.bat
