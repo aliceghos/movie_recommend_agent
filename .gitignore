@@ -41,3 +41,7 @@ scripts/fix_mojibake_filenames.py
 
 # Windows 本地启动脚本，不入库
 scripts/dev_win.bat
+scripts/run_api_win.py
+
+# 本地运行日志，不入库
+logs/
